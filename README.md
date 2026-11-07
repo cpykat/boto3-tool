@@ -79,3 +79,26 @@ readable. Account-level Block Public Access settings may still prevent access.
 Use only repositories whose contents you are authorized to publish. The
 operation requires permission to create buckets, upload objects, configure
 website hosting, and set bucket public-access and policy settings.
+
+To print an inspirational quote, use:
+
+```sh
+python main.py --inspire
+```
+
+This fetches a random quote and its author from the Quotable API. To request a
+quote from a specific author, provide their name:
+
+```sh
+python main.py --inspire "Linus Torvalds"
+```
+
+To save the quote and author as JSON at `inspiration.json` in an S3 bucket,
+provide `--save` and `--bucket`:
+
+```sh
+python main.py --inspire "Linus Torvalds" --save --bucket my-bucket
+```
+
+Saving requires AWS credentials and `s3:PutObject` permission. Without
+`--save`, the command does not require AWS credentials.

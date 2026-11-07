@@ -437,6 +437,26 @@ def download_file(url: str) -> Path:
     return destination
 
 
+def get_inspiration_quote(author_name: str | None = None) -> tuple[str, str]:
+    """Fetch one inspirational quote, optionally from a specific author."""
+    url = "https://api.quotable.kurokeita.dev/api/quotes/random"
+    if author_name:
+        url = f"{url}?author={quote(author_name)}"
+    request = Request(url, headers={"User-Agent": "boto3-tool"})
+    with urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+
+    try:
+        quote_data = payload["quote"]
+        content = quote_data["content"]
+        author = quote_data["author"]["name"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("The quote service returned an unexpected response.") from error
+    if not isinstance(content, str) or not isinstance(author, str):
+        raise ValueError("The quote service returned an unexpected response.")
+    return content, author
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Authenticate with S3 or manage buckets and objects."
@@ -582,6 +602,18 @@ def main() -> None:
         action="store_true",
         help="Group an uploaded file under its detected MIME type in S3",
     )
+    parser.add_argument(
+        "--inspire",
+        nargs="?",
+        const="",
+        metavar="AUTHOR",
+        help="Fetch and display an inspirational quote, optionally from AUTHOR",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save an --inspire quote as inspiration.json in --bucket",
+    )
     args = parser.parse_args()
 
     other_actions = any(
@@ -612,6 +644,60 @@ def main() -> None:
         parser.error("--magic-group can only be used with --upload-file")
     if other_actions and (args.download_file or args.upload_file):
         parser.error("--download-file and --upload-file cannot be combined with other actions")
+
+    if args.save and args.inspire is None:
+        parser.error("--save can only be used with --inspire")
+    if args.inspire is not None and args.save and not args.bucket:
+        parser.error("--inspire --save requires --bucket BUCKET_NAME")
+
+    if args.inspire is not None:
+        if (
+            other_actions
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or (args.bucket and not args.save)
+            or args.group_by_extension is not None
+            or args.cleanup_versions
+            or args.bucket_versioning_info
+            or args.object_versioning_info
+            or args.recover_previous
+            or args.object_key is not None
+            or args.static_web
+            or args.index_file
+            or args.static_from_source
+        ):
+            parser.error("--inspire cannot be combined with other actions")
+        try:
+            content, author = get_inspiration_quote(args.inspire or None)
+        except (URLError, TimeoutError, ValueError) as error:
+            parser.exit(1, f"Could not fetch an inspirational quote: {error}\n")
+        if args.save:
+            quote_json = json.dumps(
+                {"quote": content, "author": author},
+                indent=2,
+            )
+            try:
+                s3_client = init_client()
+                s3_client.put_object(
+                    Bucket=args.bucket,
+                    Key="inspiration.json",
+                    Body=quote_json.encode("utf-8"),
+                    ContentType="application/json",
+                )
+            except ClientError as error:
+                error_code = error.response.get("Error", {}).get("Code", "Unknown")
+                message = error.response.get("Error", {}).get("Message", str(error))
+                parser.exit(
+                    1,
+                    f"Could not save inspiration to bucket '{args.bucket}' "
+                    f"(AWS error {error_code}: {message}).\n",
+                )
+            print(f"Saved quote to '{args.bucket}/inspiration.json'.")
+        print(content)
+        print("---")
+        print(author)
+        return
 
     cleanup_requested = args.cleanup_versions
     if cleanup_requested:
