@@ -13,3 +13,13 @@ python main.py --upload-file my-bucket ./photo.jpg --magic-group
 
 For example, an image detected as `image/jpeg` is uploaded as
 `image/jpeg/photo.jpg`.
+
+To delete noncurrent versions and delete markers older than six months for a
+specific object, while preserving its current version, use:
+
+```sh
+python main.py --cleanup-versions --bucket my-bucket --object path/to/file.txt
+```
+
+This permanently deletes old versions and requires the appropriate S3
+`ListBucketVersions` and `DeleteObjectVersion` permissions.

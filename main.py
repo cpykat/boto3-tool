@@ -1,7 +1,9 @@
 import argparse
+import calendar
 import hashlib
 import json
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.error import URLError
 from urllib.parse import unquote, urlsplit
@@ -133,6 +135,39 @@ def group_objects_by_extension(s3_client, bucket_name: str) -> int:
         s3_client.delete_object(Bucket=bucket_name, Key=source_key)
 
     return len(moves)
+
+
+def cleanup_old_object_versions(s3_client, bucket_name: str, object_key: str) -> int:
+    """Delete noncurrent object versions and delete markers older than six months."""
+    now = datetime.now(timezone.utc)
+    target_month = now.month - 6
+    target_year = now.year
+    while target_month <= 0:
+        target_month += 12
+        target_year -= 1
+    cutoff_day = min(now.day, calendar.monthrange(target_year, target_month)[1])
+    cutoff = now.replace(year=target_year, month=target_month, day=cutoff_day)
+
+    paginator = s3_client.get_paginator("list_object_versions")
+    old_versions = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=object_key):
+        for field in ("Versions", "DeleteMarkers"):
+            for version in page.get(field, []):
+                if (
+                    version["Key"] == object_key
+                    and not version["IsLatest"]
+                    and version["LastModified"] < cutoff
+                ):
+                    old_versions.append(version["VersionId"])
+
+    for version_id in old_versions:
+        s3_client.delete_object(
+            Bucket=bucket_name,
+            Key=object_key,
+            VersionId=version_id,
+        )
+
+    return len(old_versions)
 
 
 def list_buckets(s3_client) -> list[str]:
@@ -272,7 +307,7 @@ def main() -> None:
     parser.add_argument(
         "--bucket",
         metavar="BUCKET_NAME",
-        help="Bucket to organize when using --group-by-extension",
+        help="Bucket to organize or clean up versions in",
     )
     parser.add_argument(
         "--group-by-extension",
@@ -280,6 +315,17 @@ def main() -> None:
         choices=("true", "false"),
         metavar="TRUE|FALSE",
         help="Move bucket objects into extension-based prefixes",
+    )
+    parser.add_argument(
+        "--cleanup-versions",
+        action="store_true",
+        help="Delete noncurrent object versions and delete markers older than six months",
+    )
+    parser.add_argument(
+        "--object",
+        dest="object_key",
+        metavar="OBJECT_KEY",
+        help="Object key to use with --cleanup-versions",
     )
     parser.add_argument(
         "--download-file",
@@ -331,7 +377,26 @@ def main() -> None:
     if other_actions and (args.download_file or args.upload_file):
         parser.error("--download-file and --upload-file cannot be combined with other actions")
 
-    grouping_requested = args.bucket is not None or args.group_by_extension is not None
+    cleanup_requested = args.cleanup_versions or args.object_key is not None
+    if cleanup_requested:
+        if not args.cleanup_versions or not args.bucket or not args.object_key:
+            parser.error(
+                "--cleanup-versions requires both --bucket BUCKET_NAME "
+                "and --object OBJECT_KEY"
+            )
+        if (
+            other_actions
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or args.group_by_extension is not None
+        ):
+            parser.error("--cleanup-versions cannot be combined with other actions")
+
+    grouping_requested = (
+        args.group_by_extension is not None
+        or (args.bucket is not None and not cleanup_requested)
+    )
     if grouping_requested:
         if args.bucket is None or args.group_by_extension is None:
             parser.error("--bucket and --group-by-extension must be used together")
@@ -369,6 +434,8 @@ def main() -> None:
             args.magic_group,
             args.bucket,
             args.group_by_extension,
+            args.cleanup_versions,
+            args.object_key,
         )
     ):
         init_client()
@@ -403,7 +470,15 @@ def main() -> None:
 
     s3_client = init_client()
     try:
-        if args.group_by_extension == "true":
+        if args.cleanup_versions:
+            deleted_count = cleanup_old_object_versions(
+                s3_client, args.bucket, args.object_key
+            )
+            print(
+                f"Deleted {deleted_count} noncurrent version(s) or delete marker(s) "
+                f"older than six months for '{args.object_key}' in bucket '{args.bucket}'."
+            )
+        elif args.group_by_extension == "true":
             moved_count = group_objects_by_extension(s3_client, args.bucket)
             print(
                 f"Moved {moved_count} object(s) into extension-based prefixes "
