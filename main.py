@@ -2,12 +2,19 @@ import argparse
 import calendar
 import hashlib
 import json
+import mimetypes
+import re
+import secrets
+import shutil
+import stat
+import tempfile
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.error import URLError
-from urllib.parse import unquote, urlsplit
-from urllib.request import urlretrieve
+from urllib.parse import quote, unquote, urlsplit
+from urllib.request import Request, urlopen, urlretrieve
 
 from boto3.exceptions import S3UploadFailedError
 from botocore.exceptions import ClientError
@@ -269,6 +276,122 @@ def create_static_website(s3_client, bucket_name: str, index_file: str) -> None:
     grant_public_read(s3_client, bucket_name, "index.html")
 
 
+def create_static_website_from_source(s3_client, source_url: str) -> tuple[str, str]:
+    """Create a public S3 website from a public GitHub repository archive."""
+    parsed_url = urlsplit(source_url)
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.hostname != "github.com"
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.port is not None
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise ValueError("Source must be a public GitHub repository URL over HTTPS.")
+
+    repository_parts = [part for part in parsed_url.path.strip("/").split("/") if part]
+    if len(repository_parts) != 2:
+        raise ValueError("Source URL must have the form https://github.com/OWNER/REPOSITORY.")
+    owner, repository = repository_parts
+    repository = repository.removesuffix(".git")
+    if not owner or not repository:
+        raise ValueError("Source URL must include a GitHub owner and repository.")
+
+    headers = {"User-Agent": "boto3-tool-static-site"}
+    api_url = f"https://api.github.com/repos/{quote(owner)}/{quote(repository)}"
+    with urlopen(Request(api_url, headers=headers), timeout=30) as response:
+        repository_info = json.load(response)
+    default_branch = repository_info.get("default_branch")
+    if not isinstance(default_branch, str) or not default_branch:
+        raise ValueError("Could not determine the repository's default branch.")
+
+    archive_url = (
+        f"https://api.github.com/repos/{quote(owner)}/{quote(repository)}"
+        f"/zipball/{quote(default_branch, safe='')}"
+    )
+    with tempfile.TemporaryDirectory(prefix="boto3-tool-site-") as temp_dir:
+        temp_path = Path(temp_dir)
+        archive_path = temp_path / "source.zip"
+        with urlopen(Request(archive_url, headers=headers), timeout=60) as response:
+            with archive_path.open("wb") as archive_file:
+                shutil.copyfileobj(response, archive_file)
+
+        website_root = temp_path / "website"
+        website_root.mkdir()
+        with zipfile.ZipFile(archive_path) as archive:
+            entries = archive.infolist()
+            roots = {
+                PurePosixPath(entry.filename).parts[0]
+                for entry in entries
+                if PurePosixPath(entry.filename).parts
+            }
+            if len(roots) != 1:
+                raise ValueError("GitHub source archive has an unexpected directory layout.")
+            archive_root = next(iter(roots))
+
+            for entry in entries:
+                archive_path_part = PurePosixPath(entry.filename)
+                if (
+                    archive_path_part.is_absolute()
+                    or ".." in archive_path_part.parts
+                    or not archive_path_part.parts
+                    or archive_path_part.parts[0] != archive_root
+                ):
+                    raise ValueError("GitHub source archive contains an unsafe file path.")
+                if entry.is_dir():
+                    continue
+                if stat.S_ISLNK(entry.external_attr >> 16):
+                    raise ValueError("GitHub source archive contains a symbolic link.")
+
+                relative_parts = archive_path_part.parts[1:]
+                if not relative_parts:
+                    continue
+                destination = website_root.joinpath(*relative_parts)
+                if not destination.resolve().is_relative_to(website_root.resolve()):
+                    raise ValueError("GitHub source archive contains an unsafe file path.")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(entry) as source_file, destination.open("wb") as output_file:
+                    shutil.copyfileobj(source_file, output_file)
+
+        if not (website_root / "index.html").is_file():
+            raise ValueError("GitHub repository must contain an index.html at its root.")
+
+        region = s3_client.meta.region_name
+        if not region:
+            raise ValueError("AWS region is not configured; cannot create a website endpoint.")
+        safe_repository = re.sub(r"[^a-z0-9-]", "-", repository.lower()).strip("-")
+        safe_repository = safe_repository or "site"
+        bucket_name = f"static-{safe_repository[:25]}-{secrets.token_hex(8)}"
+
+        create_bucket(s3_client, bucket_name)
+        disable_bucket_public_access_block(s3_client, bucket_name)
+        for file_path in website_root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            object_key = file_path.relative_to(website_root).as_posix()
+            content_type, _ = mimetypes.guess_type(object_key)
+            extra_args = {"ContentType": content_type or "application/octet-stream"}
+            s3_client.upload_file(
+                str(file_path),
+                bucket_name,
+                object_key,
+                ExtraArgs=extra_args,
+            )
+
+        s3_client.put_bucket_website(
+            Bucket=bucket_name,
+            WebsiteConfiguration={"IndexDocument": {"Suffix": "index.html"}},
+        )
+        grant_public_read(s3_client, bucket_name)
+
+    if region.startswith("cn-"):
+        website_url = f"http://{bucket_name}.s3-website.{region}.amazonaws.com.cn"
+    else:
+        website_url = f"http://{bucket_name}.s3-website-{region}.amazonaws.com"
+    return bucket_name, website_url
+
+
 def total_size_by_extension(s3_client, bucket_name: str) -> dict[str, int]:
     """Return the total object size in bytes grouped by file extension."""
     sizes: dict[str, int] = defaultdict(int)
@@ -436,6 +559,11 @@ def main() -> None:
         help="Local HTML file to upload as the website's index.html",
     )
     parser.add_argument(
+        "--static-from-source",
+        metavar="GITHUB_URL",
+        help="Create and host a static website from a public GitHub repository",
+    )
+    parser.add_argument(
         "--download-file",
         metavar="URL",
         help="Download a file from a URL into the current directory",
@@ -564,6 +692,25 @@ def main() -> None:
         ):
             parser.error("--static-web cannot be combined with other actions")
 
+    static_source_requested = args.static_from_source is not None
+    if static_source_requested:
+        if (
+            other_actions
+            or args.bucket
+            or args.index_file
+            or args.static_web
+            or args.object_key is not None
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or args.group_by_extension is not None
+            or args.cleanup_versions
+            or args.bucket_versioning_info
+            or args.object_versioning_info
+            or args.recover_previous
+        ):
+            parser.error("--static-from-source cannot be combined with other actions")
+
     if args.bucket_versioning_info:
         if not args.bucket:
             parser.error("--bucket-versioning-info requires --bucket BUCKET_NAME")
@@ -587,6 +734,7 @@ def main() -> None:
             and not object_version_info_requested
             and not recover_requested
             and not static_web_requested
+            and not static_source_requested
         )
     )
     if grouping_requested:
@@ -633,6 +781,7 @@ def main() -> None:
             args.object_key,
             args.static_web,
             args.index_file,
+            args.static_from_source,
         )
     ):
         init_client()
@@ -667,7 +816,12 @@ def main() -> None:
 
     s3_client = init_client()
     try:
-        if args.static_web:
+        if args.static_from_source is not None:
+            bucket_name, website_url = create_static_website_from_source(
+                s3_client, args.static_from_source
+            )
+            print(f"Static website created in bucket '{bucket_name}': {website_url}")
+        elif args.static_web:
             create_static_website(s3_client, args.bucket, args.index_file)
             print(
                 f"Static website bucket '{args.bucket}' created with "

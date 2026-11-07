@@ -65,3 +65,17 @@ This disables the bucket's Block Public Access settings and grants anonymous
 read access to `index.html` so the website can serve it. Account-level Block
 Public Access settings are not changed and may still prevent public access.
 The bucket name must be globally unique.
+
+To create a new static website from a public GitHub repository, use:
+
+```sh
+python main.py --static-from-source https://github.com/do-community/html_demo_site
+```
+
+The command downloads the repository's default-branch archive, requires a
+root-level `index.html`, creates a uniquely named bucket, uploads the site
+files, and prints the S3 website URL. The bucket contents are made publicly
+readable. Account-level Block Public Access settings may still prevent access.
+Use only repositories whose contents you are authorized to publish. The
+operation requires permission to create buckets, upload objects, configure
+website hosting, and set bucket public-access and policy settings.
