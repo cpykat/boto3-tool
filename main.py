@@ -40,6 +40,13 @@ def set_bucket_versioning(s3_client, bucket_name: str, enabled: bool) -> None:
     )
 
 
+def get_bucket_versioning_status(s3_client, bucket_name: str) -> str:
+    """Return the bucket's versioning status, including when it was never enabled."""
+    return s3_client.get_bucket_versioning(Bucket=bucket_name).get(
+        "Status", "Never enabled"
+    )
+
+
 def grant_public_read(s3_client, bucket_name: str, object_key: str | None = None) -> None:
     """Grant public download access to all bucket objects or one object."""
     resource = (
@@ -170,6 +177,60 @@ def cleanup_old_object_versions(s3_client, bucket_name: str, object_key: str) ->
     return len(old_versions)
 
 
+def get_object_versions(s3_client, bucket_name: str, object_key: str) -> list[dict]:
+    """Return all versions and delete markers for an exact object key."""
+    paginator = s3_client.get_paginator("list_object_versions")
+    versions = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=object_key):
+        for field, is_delete_marker in (("Versions", False), ("DeleteMarkers", True)):
+            for entry in page.get(field, []):
+                if entry["Key"] != object_key:
+                    continue
+                version = {
+                    "VersionId": entry["VersionId"],
+                    "IsLatest": entry["IsLatest"],
+                    "LastModified": entry["LastModified"].isoformat(),
+                    "IsDeleteMarker": is_delete_marker,
+                }
+                if not is_delete_marker:
+                    version["Size"] = entry["Size"]
+                versions.append(version)
+    return versions
+
+
+def recover_previous_object_version(s3_client, bucket_name: str, object_key: str) -> str:
+    """Copy the newest noncurrent data version to create a new latest version."""
+    status = get_bucket_versioning_status(s3_client, bucket_name)
+    if status != "Enabled":
+        raise ValueError(
+            f"Cannot recover a previous version while bucket versioning is {status.lower()}."
+        )
+
+    paginator = s3_client.get_paginator("list_object_versions")
+    previous_versions = []
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=object_key):
+        previous_versions.extend(
+            version
+            for version in page.get("Versions", [])
+            if version["Key"] == object_key and not version["IsLatest"]
+        )
+
+    if not previous_versions:
+        raise ValueError(f"No previous data version found for object '{object_key}'.")
+
+    previous_version = max(previous_versions, key=lambda version: version["LastModified"])
+    response = s3_client.copy_object(
+        Bucket=bucket_name,
+        CopySource={
+            "Bucket": bucket_name,
+            "Key": object_key,
+            "VersionId": previous_version["VersionId"],
+        },
+        Key=object_key,
+    )
+    return response.get("VersionId", "")
+
+
 def list_buckets(s3_client) -> list[str]:
     """Return the names of all S3 buckets accessible to the account."""
     return [bucket["Name"] for bucket in s3_client.list_buckets().get("Buckets", [])]
@@ -185,6 +246,27 @@ def create_bucket(s3_client, bucket_name: str) -> None:
         )
     else:
         s3_client.create_bucket(Bucket=bucket_name)
+
+
+def create_static_website(s3_client, bucket_name: str, index_file: str) -> None:
+    """Create a public S3 website bucket with a local file as its index page."""
+    file_path = Path(index_file)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Index file does not exist or is not a file: {file_path}")
+
+    create_bucket(s3_client, bucket_name)
+    disable_bucket_public_access_block(s3_client, bucket_name)
+    s3_client.upload_file(
+        str(file_path),
+        bucket_name,
+        "index.html",
+        ExtraArgs={"ContentType": "text/html"},
+    )
+    s3_client.put_bucket_website(
+        Bucket=bucket_name,
+        WebsiteConfiguration={"IndexDocument": {"Suffix": "index.html"}},
+    )
+    grant_public_read(s3_client, bucket_name, "index.html")
 
 
 def total_size_by_extension(s3_client, bucket_name: str) -> dict[str, int]:
@@ -322,10 +404,36 @@ def main() -> None:
         help="Delete noncurrent object versions and delete markers older than six months",
     )
     parser.add_argument(
+        "--bucket-versioning-info",
+        action="store_true",
+        help="Check whether versioning is enabled for --bucket",
+    )
+    parser.add_argument(
+        "--object-versioning-info",
+        action="store_true",
+        help="List all versions and delete markers for --object in --bucket",
+    )
+    parser.add_argument(
+        "--recover-previous",
+        action="store_true",
+        help="Restore the newest noncurrent object version as a new latest version",
+    )
+    parser.add_argument(
         "--object",
         dest="object_key",
         metavar="OBJECT_KEY",
-        help="Object key to use with --cleanup-versions",
+        help="Object key to use with version information or cleanup actions",
+    )
+    parser.add_argument(
+        "--static-web",
+        action="store_true",
+        help="Create a static website bucket using the file supplied with --index",
+    )
+    parser.add_argument(
+        "--index",
+        dest="index_file",
+        metavar="INDEX_FILE",
+        help="Local HTML file to upload as the website's index.html",
     )
     parser.add_argument(
         "--download-file",
@@ -377,7 +485,7 @@ def main() -> None:
     if other_actions and (args.download_file or args.upload_file):
         parser.error("--download-file and --upload-file cannot be combined with other actions")
 
-    cleanup_requested = args.cleanup_versions or args.object_key is not None
+    cleanup_requested = args.cleanup_versions
     if cleanup_requested:
         if not args.cleanup_versions or not args.bucket or not args.object_key:
             parser.error(
@@ -393,9 +501,93 @@ def main() -> None:
         ):
             parser.error("--cleanup-versions cannot be combined with other actions")
 
+    object_version_info_requested = args.object_versioning_info
+    if object_version_info_requested:
+        if not args.bucket or not args.object_key:
+            parser.error(
+                "--object-versioning-info requires --bucket BUCKET_NAME "
+                "and --object OBJECT_KEY"
+            )
+        if (
+            other_actions
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or args.group_by_extension is not None
+            or args.cleanup_versions
+            or args.bucket_versioning_info
+        ):
+            parser.error("--object-versioning-info cannot be combined with other actions")
+
+    recover_requested = args.recover_previous
+    if recover_requested:
+        if not args.bucket or not args.object_key:
+            parser.error(
+                "--recover-previous requires both --bucket BUCKET_NAME "
+                "and --object OBJECT_KEY"
+            )
+        if (
+            other_actions
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or args.group_by_extension is not None
+            or args.cleanup_versions
+            or args.bucket_versioning_info
+            or args.object_versioning_info
+        ):
+            parser.error("--recover-previous cannot be combined with other actions")
+
+    if args.object_key is not None and not (
+        args.cleanup_versions or args.object_versioning_info or args.recover_previous
+    ):
+        parser.error(
+            "--object requires --cleanup-versions, --object-versioning-info, "
+            "or --recover-previous"
+        )
+
+    static_web_requested = args.static_web or args.index_file is not None
+    if static_web_requested:
+        if not args.static_web or not args.bucket or not args.index_file:
+            parser.error("--static-web requires --bucket BUCKET_NAME and --index INDEX_FILE")
+        if (
+            other_actions
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or args.group_by_extension is not None
+            or args.cleanup_versions
+            or args.bucket_versioning_info
+            or args.object_versioning_info
+            or args.recover_previous
+            or args.object_key is not None
+        ):
+            parser.error("--static-web cannot be combined with other actions")
+
+    if args.bucket_versioning_info:
+        if not args.bucket:
+            parser.error("--bucket-versioning-info requires --bucket BUCKET_NAME")
+        if (
+            other_actions
+            or args.download_file
+            or args.upload_file
+            or args.magic_group
+            or args.group_by_extension is not None
+            or cleanup_requested
+            or recover_requested
+        ):
+            parser.error("--bucket-versioning-info cannot be combined with other actions")
+
     grouping_requested = (
         args.group_by_extension is not None
-        or (args.bucket is not None and not cleanup_requested)
+        or (
+            args.bucket is not None
+            and not cleanup_requested
+            and not args.bucket_versioning_info
+            and not object_version_info_requested
+            and not recover_requested
+            and not static_web_requested
+        )
     )
     if grouping_requested:
         if args.bucket is None or args.group_by_extension is None:
@@ -435,7 +627,12 @@ def main() -> None:
             args.bucket,
             args.group_by_extension,
             args.cleanup_versions,
+            args.bucket_versioning_info,
+            args.object_versioning_info,
+            args.recover_previous,
             args.object_key,
+            args.static_web,
+            args.index_file,
         )
     ):
         init_client()
@@ -470,7 +667,44 @@ def main() -> None:
 
     s3_client = init_client()
     try:
-        if args.cleanup_versions:
+        if args.static_web:
+            create_static_website(s3_client, args.bucket, args.index_file)
+            print(
+                f"Static website bucket '{args.bucket}' created with "
+                f"'{args.index_file}' as index.html."
+            )
+        elif args.recover_previous:
+            version_id = recover_previous_object_version(
+                s3_client, args.bucket, args.object_key
+            )
+            if version_id:
+                print(
+                    f"Recovered the previous version of '{args.object_key}' in "
+                    f"bucket '{args.bucket}' as new version '{version_id}'."
+                )
+            else:
+                print(
+                    f"Recovered the previous version of '{args.object_key}' "
+                    f"in bucket '{args.bucket}' as the new latest version."
+                )
+        elif args.object_versioning_info:
+            versions = get_object_versions(s3_client, args.bucket, args.object_key)
+            if versions:
+                print(json.dumps(versions, indent=2))
+            else:
+                print(
+                    f"No versions found for '{args.object_key}' "
+                    f"in bucket '{args.bucket}'."
+                )
+        elif args.bucket_versioning_info:
+            status = get_bucket_versioning_status(s3_client, args.bucket)
+            if status == "Enabled":
+                print(f"Versioning is enabled for bucket '{args.bucket}'.")
+            elif status == "Suspended":
+                print(f"Versioning is suspended for bucket '{args.bucket}'.")
+            else:
+                print(f"Versioning has never been enabled for bucket '{args.bucket}'.")
+        elif args.cleanup_versions:
             deleted_count = cleanup_old_object_versions(
                 s3_client, args.bucket, args.object_key
             )
