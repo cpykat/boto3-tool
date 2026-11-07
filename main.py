@@ -165,13 +165,23 @@ def total_size_by_extension(s3_client, bucket_name: str) -> dict[str, int]:
     return dict(sizes)
 
 
-def upload_local_file(s3_client, bucket_name: str, local_file: str) -> str:
-    """Upload a local file to S3 using its filename as the object key."""
+def upload_local_file(
+    s3_client, bucket_name: str, local_file: str, magic_group: bool = False
+) -> str:
+    """Upload a local file, optionally grouping it by detected MIME type."""
     file_path = Path(local_file)
     if not file_path.is_file():
         raise FileNotFoundError(f"Local file does not exist or is not a file: {file_path}")
 
     object_key = file_path.name
+    if magic_group:
+        import magic
+
+        mime_type = magic.from_file(str(file_path), mime=True)
+        if not isinstance(mime_type, str) or "/" not in mime_type:
+            raise ValueError(f"Could not determine a valid MIME type for '{file_path}'.")
+        object_key = f"{mime_type}/{object_key}"
+
     s3_client.upload_file(str(file_path), bucket_name, object_key)
     return object_key
 
@@ -285,6 +295,11 @@ def main() -> None:
             "BUCKET_NAME"
         ),
     )
+    parser.add_argument(
+        "--magic-group",
+        action="store_true",
+        help="Group an uploaded file under its detected MIME type in S3",
+    )
     args = parser.parse_args()
 
     other_actions = any(
@@ -311,6 +326,8 @@ def main() -> None:
                 "--upload-file requires BUCKET_NAME LOCAL_FILE, or just BUCKET_NAME "
                 "when used with --download-file"
             )
+    elif args.magic_group:
+        parser.error("--magic-group can only be used with --upload-file")
     if other_actions and (args.download_file or args.upload_file):
         parser.error("--download-file and --upload-file cannot be combined with other actions")
 
@@ -318,7 +335,7 @@ def main() -> None:
     if grouping_requested:
         if args.bucket is None or args.group_by_extension is None:
             parser.error("--bucket and --group-by-extension must be used together")
-        if other_actions or args.download_file or args.upload_file:
+        if other_actions or args.download_file or args.upload_file or args.magic_group:
             parser.error("--bucket/--group-by-extension cannot be combined with other actions")
         if args.group_by_extension == "false":
             print("Grouping by extension is disabled; no objects were changed.")
@@ -349,6 +366,7 @@ def main() -> None:
             args.size_by_extension,
             args.upload_file,
             args.download_file,
+            args.magic_group,
             args.bucket,
             args.group_by_extension,
         )
@@ -446,7 +464,9 @@ def main() -> None:
                 local_file = str(downloaded_file)
             else:
                 bucket_name, local_file = args.upload_file
-            object_key = upload_local_file(s3_client, bucket_name, local_file)
+            object_key = upload_local_file(
+                s3_client, bucket_name, local_file, magic_group=args.magic_group
+            )
             print(f"Uploaded '{local_file}' to '{bucket_name}/{object_key}'.")
         else:
             bucket_name = args.enable_versioning or args.disable_versioning
