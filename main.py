@@ -1,0 +1,407 @@
+import argparse
+import hashlib
+import json
+from collections import defaultdict
+from pathlib import Path, PurePosixPath
+from urllib.error import URLError
+from urllib.parse import unquote, urlsplit
+from urllib.request import urlretrieve
+
+from boto3.exceptions import S3UploadFailedError
+from botocore.exceptions import ClientError
+
+from auth import init_client
+
+
+def bucket_exists(bucket_name: str) -> bool:
+    """Return whether an S3 bucket exists using credentials from auth.py."""
+    s3_client = init_client()
+
+    try:
+        s3_client.head_bucket(Bucket=bucket_name)
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code")
+        status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if error_code in {"404", "NoSuchBucket"} or status_code == 404:
+            return False
+        raise
+
+    return True
+
+
+def set_bucket_versioning(s3_client, bucket_name: str, enabled: bool) -> None:
+    """Enable or suspend versioning for an S3 bucket."""
+    status = "Enabled" if enabled else "Suspended"
+    s3_client.put_bucket_versioning(
+        Bucket=bucket_name,
+        VersioningConfiguration={"Status": status},
+    )
+
+
+def grant_public_read(s3_client, bucket_name: str, object_key: str | None = None) -> None:
+    """Grant public download access to all bucket objects or one object."""
+    resource = (
+        f"arn:aws:s3:::{bucket_name}/{object_key}"
+        if object_key is not None
+        else f"arn:aws:s3:::{bucket_name}/*"
+    )
+    statement_id = "PublicRead" + hashlib.sha256(resource.encode("utf-8")).hexdigest()[:16]
+    statement = {
+        "Sid": statement_id,
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": resource,
+    }
+
+    try:
+        policy = json.loads(s3_client.get_bucket_policy(Bucket=bucket_name)["Policy"])
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") != "NoSuchBucketPolicy":
+            raise
+        policy = {"Version": "2012-10-17", "Statement": []}
+
+    statements = policy.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    statements = [
+        existing for existing in statements if existing.get("Sid") != statement_id
+    ]
+    statements.append(statement)
+    policy["Statement"] = statements
+
+    s3_client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(policy))
+
+
+def read_bucket_policy(s3_client, bucket_name: str) -> dict:
+    """Return the bucket policy as a JSON object."""
+    return json.loads(s3_client.get_bucket_policy(Bucket=bucket_name)["Policy"])
+
+
+def disable_bucket_public_access_block(s3_client, bucket_name: str) -> None:
+    """Disable all bucket-level S3 Block Public Access settings."""
+    s3_client.put_public_access_block(
+        Bucket=bucket_name,
+        PublicAccessBlockConfiguration={
+            "BlockPublicAcls": False,
+            "IgnorePublicAcls": False,
+            "BlockPublicPolicy": False,
+            "RestrictPublicBuckets": False,
+        },
+    )
+
+
+def list_objects(s3_client, bucket_name: str) -> list[str]:
+    """Return all object keys in an S3 bucket."""
+    paginator = s3_client.get_paginator("list_objects_v2")
+    return [
+        item["Key"]
+        for page in paginator.paginate(Bucket=bucket_name)
+        for item in page.get("Contents", [])
+    ]
+
+
+def list_buckets(s3_client) -> list[str]:
+    """Return the names of all S3 buckets accessible to the account."""
+    return [bucket["Name"] for bucket in s3_client.list_buckets().get("Buckets", [])]
+
+
+def create_bucket(s3_client, bucket_name: str) -> None:
+    """Create an S3 bucket in the client's configured region."""
+    region = s3_client.meta.region_name
+    if region and region != "us-east-1":
+        s3_client.create_bucket(
+            Bucket=bucket_name,
+            CreateBucketConfiguration={"LocationConstraint": region},
+        )
+    else:
+        s3_client.create_bucket(Bucket=bucket_name)
+
+
+def total_size_by_extension(s3_client, bucket_name: str) -> dict[str, int]:
+    """Return the total object size in bytes grouped by file extension."""
+    sizes: dict[str, int] = defaultdict(int)
+    paginator = s3_client.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=bucket_name):
+        for item in page.get("Contents", []):
+            extension = PurePosixPath(item["Key"]).suffix.lower() or "(no extension)"
+            sizes[extension] += item["Size"]
+
+    return dict(sizes)
+
+
+def upload_local_file(s3_client, bucket_name: str, local_file: str) -> str:
+    """Upload a local file to S3 using its filename as the object key."""
+    file_path = Path(local_file)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Local file does not exist or is not a file: {file_path}")
+
+    object_key = file_path.name
+    s3_client.upload_file(str(file_path), bucket_name, object_key)
+    return object_key
+
+
+def download_file(url: str) -> Path:
+    """Download a URL to the current directory using its filename."""
+    filename = PurePosixPath(unquote(urlsplit(url).path)).name
+    if filename in {"", ".", ".."}:
+        raise ValueError("The URL must include a filename in its path.")
+
+    destination = Path(filename)
+    urlretrieve(url, destination)
+    return destination
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Authenticate with S3 or manage buckets and objects."
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
+        "--list-buckets",
+        action="store_true",
+        help="List all S3 buckets accessible to the account",
+    )
+    action.add_argument(
+        "--create-bucket",
+        metavar="BUCKET_NAME",
+        help="Create an S3 bucket in the configured region",
+    )
+    action.add_argument(
+        "--check-bucket",
+        metavar="BUCKET_NAME",
+        help="Check whether the specified S3 bucket exists",
+    )
+    action.add_argument(
+        "--read-bucket-policy",
+        metavar="BUCKET_NAME",
+        help="Read the policy for the specified S3 bucket",
+    )
+    action.add_argument(
+        "--disable-block-public",
+        metavar="BUCKET_NAME",
+        help="Disable all bucket-level S3 Block Public Access settings",
+    )
+    action.add_argument(
+        "--delete-bucket",
+        metavar="BUCKET_NAME",
+        help="Delete the specified empty S3 bucket",
+    )
+    action.add_argument(
+        "--delete-object",
+        nargs=2,
+        metavar=("BUCKET_NAME", "OBJECT_KEY"),
+        help="Delete the specified object from an S3 bucket",
+    )
+    action.add_argument(
+        "--enable-versioning",
+        metavar="BUCKET_NAME",
+        help="Enable versioning for the specified S3 bucket",
+    )
+    action.add_argument(
+        "--disable-versioning",
+        metavar="BUCKET_NAME",
+        help="Suspend versioning for the specified S3 bucket",
+    )
+    action.add_argument(
+        "--public-read-bucket",
+        metavar="BUCKET_NAME",
+        help="Allow anyone to download objects in the specified bucket",
+    )
+    action.add_argument(
+        "--public-read-object",
+        nargs=2,
+        metavar=("BUCKET_NAME", "OBJECT_KEY"),
+        help="Allow anyone to download the specified object",
+    )
+    action.add_argument(
+        "--list-object",
+        metavar="BUCKET_NAME",
+        help="List all object keys in the specified bucket",
+    )
+    action.add_argument(
+        "--size-by-extension",
+        metavar="BUCKET_NAME",
+        help="Show total object size grouped by file extension",
+    )
+    parser.add_argument(
+        "--download-file",
+        metavar="URL",
+        help="Download a file from a URL into the current directory",
+    )
+    parser.add_argument(
+        "--upload-file",
+        nargs="+",
+        metavar="ARGUMENT",
+        help=(
+            "Upload BUCKET_NAME LOCAL_FILE, or pair with --download-file and provide "
+            "BUCKET_NAME"
+        ),
+    )
+    args = parser.parse_args()
+
+    other_actions = any(
+        (
+            args.list_buckets,
+            args.create_bucket,
+            args.check_bucket,
+            args.read_bucket_policy,
+            args.disable_block_public,
+            args.delete_bucket,
+            args.delete_object,
+            args.enable_versioning,
+            args.disable_versioning,
+            args.public_read_bucket,
+            args.public_read_object,
+            args.list_object,
+            args.size_by_extension,
+        )
+    )
+    if args.upload_file:
+        expected_upload_arguments = 1 if args.download_file else 2
+        if len(args.upload_file) != expected_upload_arguments:
+            parser.error(
+                "--upload-file requires BUCKET_NAME LOCAL_FILE, or just BUCKET_NAME "
+                "when used with --download-file"
+            )
+    if other_actions and (args.download_file or args.upload_file):
+        parser.error("--download-file and --upload-file cannot be combined with other actions")
+
+    if args.download_file and not args.upload_file:
+        try:
+            downloaded_file = download_file(args.download_file)
+        except (OSError, URLError, ValueError) as error:
+            parser.exit(1, f"Could not download '{args.download_file}': {error}\n")
+        print(f"Downloaded '{args.download_file}' to '{downloaded_file}'.")
+        return
+
+    if not any(
+        (
+            args.list_buckets,
+            args.create_bucket,
+            args.check_bucket,
+            args.read_bucket_policy,
+            args.disable_block_public,
+            args.delete_bucket,
+            args.delete_object,
+            args.enable_versioning,
+            args.disable_versioning,
+            args.public_read_bucket,
+            args.public_read_object,
+            args.list_object,
+            args.size_by_extension,
+            args.upload_file,
+            args.download_file,
+        )
+    ):
+        init_client()
+        return
+
+    if args.check_bucket:
+        try:
+            exists = bucket_exists(args.check_bucket)
+        except ClientError as error:
+            error_code = error.response.get("Error", {}).get("Code", "Unknown")
+            status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if (
+                error_code in {"403", "AccessDenied", "BucketAlreadyExists"}
+                or status_code == 403
+            ):
+                parser.exit(
+                    1,
+                    f"Cannot access bucket '{args.check_bucket}'. Its name may already be "
+                    "in use by another AWS account, or your credentials may lack permission.\n",
+                )
+            parser.exit(
+                1,
+                f"Could not check bucket '{args.check_bucket}' "
+                f"(AWS error {error_code}): {error}\n",
+            )
+
+        if exists:
+            print(f"Bucket '{args.check_bucket}' exists.")
+        else:
+            print(f"Bucket '{args.check_bucket}' does not exist.")
+        return
+
+    s3_client = init_client()
+    try:
+        if args.list_buckets:
+            bucket_names = list_buckets(s3_client)
+            if bucket_names:
+                print("\n".join(bucket_names))
+            else:
+                print("No buckets found.")
+        elif args.create_bucket:
+            create_bucket(s3_client, args.create_bucket)
+            print(f"Bucket '{args.create_bucket}' created.")
+        elif args.read_bucket_policy:
+            policy = read_bucket_policy(s3_client, args.read_bucket_policy)
+            print(json.dumps(policy, indent=2))
+        elif args.disable_block_public:
+            disable_bucket_public_access_block(s3_client, args.disable_block_public)
+            print(
+                f"Bucket-level Block Public Access settings disabled for "
+                f"'{args.disable_block_public}'."
+            )
+        elif args.delete_bucket:
+            s3_client.delete_bucket(Bucket=args.delete_bucket)
+            print(f"Bucket '{args.delete_bucket}' deleted.")
+        elif args.delete_object:
+            bucket_name, object_key = args.delete_object
+            s3_client.delete_object(Bucket=bucket_name, Key=object_key)
+            print(f"Object '{object_key}' deleted from bucket '{bucket_name}'.")
+        elif args.public_read_bucket or args.public_read_object:
+            if args.public_read_bucket:
+                bucket_name = args.public_read_bucket
+                grant_public_read(s3_client, bucket_name)
+                print(f"Objects in bucket '{bucket_name}' are publicly readable.")
+            else:
+                bucket_name, object_key = args.public_read_object
+                grant_public_read(s3_client, bucket_name, object_key)
+                print(f"Object '{object_key}' in bucket '{bucket_name}' is publicly readable.")
+        elif args.list_object:
+            object_keys = list_objects(s3_client, args.list_object)
+            if object_keys:
+                print("\n".join(object_keys))
+            else:
+                print(f"No objects found in bucket '{args.list_object}'.")
+        elif args.size_by_extension:
+            sizes = total_size_by_extension(s3_client, args.size_by_extension)
+            if sizes:
+                for extension, size in sorted(sizes.items()):
+                    print(f"{extension}: {size} bytes")
+            else:
+                print(f"No objects found in bucket '{args.size_by_extension}'.")
+        elif args.upload_file:
+            if args.download_file:
+                bucket_name = args.upload_file[0]
+                downloaded_file = download_file(args.download_file)
+                print(f"Downloaded '{args.download_file}' to '{downloaded_file}'.")
+                local_file = str(downloaded_file)
+            else:
+                bucket_name, local_file = args.upload_file
+            object_key = upload_local_file(s3_client, bucket_name, local_file)
+            print(f"Uploaded '{local_file}' to '{bucket_name}/{object_key}'.")
+        else:
+            bucket_name = args.enable_versioning or args.disable_versioning
+            enabled = args.enable_versioning is not None
+            set_bucket_versioning(s3_client, bucket_name, enabled)
+            status = "enabled" if enabled else "suspended"
+            print(f"Versioning {status} for bucket '{bucket_name}'.")
+    except (ClientError, S3UploadFailedError, OSError, URLError, ValueError) as error:
+        if isinstance(error, ClientError):
+            error_code = error.response.get("Error", {}).get("Code", "Unknown")
+            message = error.response.get("Error", {}).get("Message", str(error))
+            detail = f"AWS error {error_code}: {message}"
+        else:
+            detail = f"{type(error).__name__}: {error}"
+        parser.exit(
+            1,
+            f"Could not perform the requested S3 operation ({detail}).\n",
+        )
+
+
+if __name__ == "__main__":
+    main()
