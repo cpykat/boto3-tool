@@ -101,6 +101,40 @@ def list_objects(s3_client, bucket_name: str) -> list[str]:
     ]
 
 
+def group_objects_by_extension(s3_client, bucket_name: str) -> int:
+    """Move bucket objects under key prefixes named for their file extensions."""
+    object_keys = list_objects(s3_client, bucket_name)
+    existing_keys = set(object_keys)
+    moves = []
+
+    for source_key in object_keys:
+        if source_key.endswith("/"):
+            continue
+
+        extension = PurePosixPath(source_key).suffix.lower()
+        folder = extension[1:] if extension else "no-extension"
+        if source_key.split("/", 1)[0] == folder:
+            continue
+
+        destination_key = f"{folder}/{source_key}"
+        if destination_key in existing_keys:
+            raise ValueError(
+                f"Cannot move '{source_key}': destination "
+                f"'{destination_key}' already exists."
+            )
+        moves.append((source_key, destination_key))
+
+    for source_key, destination_key in moves:
+        s3_client.copy_object(
+            Bucket=bucket_name,
+            CopySource={"Bucket": bucket_name, "Key": source_key},
+            Key=destination_key,
+        )
+        s3_client.delete_object(Bucket=bucket_name, Key=source_key)
+
+    return len(moves)
+
+
 def list_buckets(s3_client) -> list[str]:
     """Return the names of all S3 buckets accessible to the account."""
     return [bucket["Name"] for bucket in s3_client.list_buckets().get("Buckets", [])]
@@ -226,6 +260,18 @@ def main() -> None:
         help="Show total object size grouped by file extension",
     )
     parser.add_argument(
+        "--bucket",
+        metavar="BUCKET_NAME",
+        help="Bucket to organize when using --group-by-extension",
+    )
+    parser.add_argument(
+        "--group-by-extension",
+        type=str.lower,
+        choices=("true", "false"),
+        metavar="TRUE|FALSE",
+        help="Move bucket objects into extension-based prefixes",
+    )
+    parser.add_argument(
         "--download-file",
         metavar="URL",
         help="Download a file from a URL into the current directory",
@@ -268,6 +314,16 @@ def main() -> None:
     if other_actions and (args.download_file or args.upload_file):
         parser.error("--download-file and --upload-file cannot be combined with other actions")
 
+    grouping_requested = args.bucket is not None or args.group_by_extension is not None
+    if grouping_requested:
+        if args.bucket is None or args.group_by_extension is None:
+            parser.error("--bucket and --group-by-extension must be used together")
+        if other_actions or args.download_file or args.upload_file:
+            parser.error("--bucket/--group-by-extension cannot be combined with other actions")
+        if args.group_by_extension == "false":
+            print("Grouping by extension is disabled; no objects were changed.")
+            return
+
     if args.download_file and not args.upload_file:
         try:
             downloaded_file = download_file(args.download_file)
@@ -293,6 +349,8 @@ def main() -> None:
             args.size_by_extension,
             args.upload_file,
             args.download_file,
+            args.bucket,
+            args.group_by_extension,
         )
     ):
         init_client()
@@ -327,7 +385,13 @@ def main() -> None:
 
     s3_client = init_client()
     try:
-        if args.list_buckets:
+        if args.group_by_extension == "true":
+            moved_count = group_objects_by_extension(s3_client, args.bucket)
+            print(
+                f"Moved {moved_count} object(s) into extension-based prefixes "
+                f"in bucket '{args.bucket}'."
+            )
+        elif args.list_buckets:
             bucket_names = list_buckets(s3_client)
             if bucket_names:
                 print("\n".join(bucket_names))
